@@ -1,0 +1,84 @@
+# Purl upgrade planner
+
+You've got a list of packages (a CSV export from a vulnerability scanner, a
+manual sample someone emailed over, whatever) and you want to know, for each
+one: what's the newest version, is there a version with no actionable Socket
+alerts, and if the package itself is dead, what should replace it. This script
+answers all three, deterministically, from Socket's data and the upstream
+registries -- no manual per-package research.
+
+## Run it
+
+```
+export SOCKET_API_KEY=...          # or SOCKET_SECURITY_API_TOKEN
+python3 socket_purl_upgrade.py input.csv --org your-org-slug --out report
+```
+
+`input.csv` is a CSV (purl column auto-detected) or a plain text file, one purl
+per line. Outputs: `report.csv` / `report_alerts.csv` / `report_alert_summary.csv`
+and a 4-sheet `report.xlsx` (skip with `--no-xlsx`).
+
+## What's in the report
+
+- **newest_version / safe_version** -- newest release, and the newest release
+  Socket doesn't flag under your chosen `--safe-mode` (default: alerts your org
+  policy would act on).
+- **fixes_api_version** -- for npm, pypi, and maven packages carrying a known
+  CVE, the exact version the Socket Fixes API computes (the same
+  dependency-graph-aware engine behind `socket fix`), with the specific GHSAs
+  it resolves, CISA KEV status, and update type (patch/minor/major). This is
+  more precise than `safe_version` alone: `safe_version` just checks whether
+  Socket alerts on a given version in isolation; the Fixes API accounts for
+  transitive impact across the dependency graph. When they disagree, the
+  `notes` column says so and the recommendation prefers the Fixes API.
+- **socket_\*_score** -- Socket's own 0-100 scores (overall, supply chain,
+  quality, maintenance, vulnerability, license), already on the purl API
+  response.
+- **input_version_published_at / input_version_age_days** -- package age.
+  Prefers Socket's own `publishedAt`, falls back to the registry's per-version
+  publish date when Socket hasn't backfilled it (common for older packages).
+  `age_source` says which one fired.
+- **registry_link / source_code_link** -- human-facing registry page, and the
+  repository URL where the registry exposes one (npm, pypi, cargo, rubygems,
+  nuget). Maven doesn't carry a per-version source link in its metadata index,
+  so that column is blank for maven rows -- a real gap, not a bug, and one
+  Socket is well positioned to close at scale by resolving it once centrally
+  instead of leaving every downstream tool to guess.
+- **replacement_package** -- when the newest release is itself deprecated,
+  the package the registry (or the deprecation notice) names as the successor.
+- Every Socket alert on the input version, in `_alerts.csv`, with the GHSA id
+  and the `socket fix --id ...` hint Socket attaches to fixable ones.
+
+## Why this needs `--org`
+
+`POST /v0/purl` (no org scope) was deprecated 2026-01-05 and its stated
+removal date has already passed. This script uses the org-scoped successor,
+`POST /v0/orgs/{org}/purl`, which is not deprecated and additionally supports
+repo-label policy scoping.
+
+## The Fixes API cross-reference, mechanically
+
+For every input purl with a GHSA-bearing alert, in an ecosystem this script
+knows how to synthesize a manifest for (npm/pypi/maven), it builds a minimal,
+exact-pinned manifest (`package.json` / `requirements.txt` / `pom.xml`) for
+just those packages, uploads it (`upload-manifest-files`), and asks
+`GET /orgs/{org}/fixes?tar_hash=...&vulnerability_ids=*` for the fix. Large
+batches go 40 packages per call: the dependency-graph resolution behind
+`/fixes` is compute-heavy server-side (measured live: ~50s at 40 packages,
+~260s at 100, timeout at 200+), and a manifest can pin only one version per
+package name, so same-name different-version inputs also split across calls.
+Each fix is keyed to the exact input version it applies to. Gate
+suggested versions by age with `--minimum-release-age` (e.g. `2d`), or turn
+this stage off entirely with `--no-fixes-api` if your token doesn't have the
+`fixes:list` / `full-scans:create` scopes. Other ecosystems (golang, cargo,
+gem, nuget, github, apk) fall back to `safe_version` alone -- the pattern
+extends to any of them; only the manifest-synthesis step is unwritten for
+those.
+
+## Everything else
+
+Version comparison, prerelease handling, deprecation-notice parsing, and the
+replacement-package lookup are unchanged from the original prototype this
+builds on. See the module docstring in `socket_purl_upgrade.py` for the full
+option list (`--safe-mode`, `--include-prerelease`, `--threads`, caching,
+Alpine branch/repo selection, etc.).
