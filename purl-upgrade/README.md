@@ -15,8 +15,24 @@ python3 socket_purl_upgrade.py input.csv --org your-org-slug --out report
 ```
 
 `input.csv` is a CSV (purl column auto-detected) or a plain text file, one purl
-per line. Outputs: `report.csv` / `report_alerts.csv` / `report_alert_summary.csv`
-and a 4-sheet `report.xlsx` (skip with `--no-xlsx`).
+per line. Purls are standard package identifiers
+([purl spec](https://github.com/package-url/purl-spec)) naming an ecosystem,
+package, and version:
+
+```
+pkg:npm/lodash@4.17.20
+pkg:npm/@scope/some-package@1.2.3
+pkg:pypi/django@3.2
+pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1
+```
+
+Outputs: `report.csv` / `report_alerts.csv` / `report_alert_summary.csv` and a
+4-sheet `report.xlsx` (needs the optional `xlsxwriter` package; skipped with a
+note if it isn't installed, or skip explicitly with `--no-xlsx`).
+
+First time using the Socket API? The top-level README's Requirements section
+covers creating a token, the scopes these scripts need, and finding your org
+slug.
 
 ## What's in the report
 
@@ -61,7 +77,9 @@ repo-label policy scoping.
 For every input purl with a GHSA-bearing alert, in an ecosystem this script
 knows how to synthesize a manifest for (npm/pypi/maven), it builds a minimal,
 exact-pinned manifest (`package.json` / `requirements.txt` / `pom.xml`) for
-just those packages, uploads it (`upload-manifest-files`), and asks
+just those packages, uploads it (`upload-manifest-files` -- callable with your
+ordinary API token, though not yet in the public API reference; see the
+top-level README), and asks
 `GET /orgs/{org}/fixes?tar_hash=...&vulnerability_ids=*` for the fix. Large
 batches go 40 packages per call: the dependency-graph resolution behind
 `/fixes` is compute-heavy server-side (measured live: ~50s at 40 packages,

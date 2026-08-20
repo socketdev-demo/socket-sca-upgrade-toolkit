@@ -10,6 +10,25 @@ replace it."
 This repo is two runnable examples of doing that turn programmatically instead
 of by hand.
 
+## Requirements
+
+Python 3.9+, stdlib only (`xlsxwriter` optional, for the `.xlsx` output in
+`purl-upgrade`). `SOCKET_API_KEY` (or `SOCKET_SECURITY_API_TOKEN`) with
+`packages:list`, `fixes:list`, and `full-scans:create` scopes covers
+everything both scripts do.
+
+First time using the Socket API? Create a token in your Socket dashboard's
+API token settings (Settings > API Tokens) and grant it the three scopes
+above -- [Creating and Managing API Tokens](https://docs.socket.dev/reference/creating-and-managing-api-tokens)
+walks through it. Both scripts also take `--org`, your Socket org slug: a
+short lowercase identifier for your organization, not necessarily the same as
+its display name. Not sure of yours? This lists every org your token can
+access; use the `slug` field:
+
+```
+curl -s -u "$SOCKET_API_KEY:" https://api.socket.dev/v0/organizations
+```
+
 ## purl-upgrade/
 
 Input: a list of packages (a CSV export, a manual sample, whatever you've got).
@@ -67,21 +86,25 @@ than a one-off check), nothing about the shape changes -- point `--org` and
 your input at the right place and run it in CI on whatever cadence the
 campaign needs.
 
-## What's documented API versus what's internal
+## Which endpoints are in the public API docs
 
-`purl-upgrade` uses the org-scoped purl endpoint and the Fixes API, both
-public and documented at docs.socket.dev. `reachability` leads with
-`upload-manifest-files` / `compute-artifacts`, which are not in the public API
-reference as of this writing -- real, stable in practice, and how Socket's own
-pipeline works internally, but worth confirming current behavior with your
-Socket contact before treating them as a stable contract. Each script's own
-README says exactly which calls fall in which category, and `reachability/README.md`
-has the documented full-scans + CLI equivalent validated against the same
-sample manifests.
+Everything these scripts call is an ordinary HTTPS endpoint on
+`api.socket.dev`, authenticated with the same API token as everything else --
+no special access, no Socket-internal systems. The only distinction is
+whether the endpoint appears in the public API reference yet:
 
-## Requirements
+- **Documented at docs.socket.dev:** the org-scoped purl endpoint
+  (`POST /orgs/{org}/purl`), the Fixes API (`GET /orgs/{org}/fixes`), and the
+  full-scans API.
+- **Not in the public API reference as of this writing:**
+  `upload-manifest-files` and `compute-artifacts`. `reachability` leads with
+  these two, and `purl-upgrade` uses `upload-manifest-files` to stage the
+  synthesized manifests for its Fixes API cross-reference. Your own token
+  calls them today -- that is exactly what these scripts do -- but since
+  they're not on the reference page, their shape could change without the
+  usual deprecation notice. Confirm current behavior with your Socket contact
+  before treating them as a stable contract.
 
-Python 3.9+, stdlib only (`xlsxwriter` optional, for the `.xlsx` output in
-`purl-upgrade`). `SOCKET_API_KEY` (or `SOCKET_SECURITY_API_TOKEN`) with
-`packages:list`, `fixes:list`, and `full-scans:create` scopes covers
-everything both scripts do.
+Each script's own README says which calls fall in which category, and
+`reachability/README.md` has the documented full-scans + CLI equivalent
+validated against the same sample manifests.
