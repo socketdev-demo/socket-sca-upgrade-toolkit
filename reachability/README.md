@@ -18,6 +18,8 @@ python3 reachability_demo.py --org your-org-slug
 ```
 
 That's the whole setup. No repo to create, nothing to check into a dashboard.
+First time using the Socket API? The top-level README's Requirements section
+covers creating a token, the scopes it needs, and finding your org slug.
 
 ## What it does
 
@@ -64,12 +66,16 @@ once you're ready to add one CLI flag in CI.
 ## Two endpoints here aren't in the public API reference
 
 `upload-manifest-files` and `compute-artifacts` are not documented at
-`docs.socket.dev` as of this writing. They're real, stable in practice, and
-this is exactly how Socket's own scanning pipeline uses them internally, but
-confirm current behavior and quota terms with your Socket contact before
-building production automation on them or committing to them contractually.
-The Fixes API (`GET /orgs/{org}/fixes`) and everything below are public and
-documented.
+`docs.socket.dev` as of this writing. That is the only caveat: they are
+ordinary HTTPS endpoints on `api.socket.dev`, and the same API token you use
+for every other call in this toolkit calls them -- no special access, no
+Socket-internal credentials, nothing pulled from Socket-side systems. This
+script is the proof: run it with your own token and both calls succeed.
+Because they're not on the public reference page, though, their shape could
+change without the usual deprecation notice -- confirm current behavior and
+quota terms with your Socket contact before building production automation on
+them or committing to them contractually. The Fixes API
+(`GET /orgs/{org}/fixes`) and everything below are public and documented.
 
 ## The production-recommended path: full-scans + the CLI
 

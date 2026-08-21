@@ -356,13 +356,13 @@ LOWERCASE_VERSION_ECOSYSTEMS = {"apk", "github", "deb", "rpm"}
 
 
 def normalize_version(eco, version):
-    """Registries whose version strings are canonically lowercase (BD upcases input)."""
+    """Registries whose version strings are canonically lowercase (some scanner exports upcase input)."""
     return version.lower() if eco in LOWERCASE_VERSION_ECOSYSTEMS else version
 
 
 def reconcile_version(eco, version, known_versions):
     """Adopt the registry's exact spelling for versions that are the same
-    release written differently: case (BD upcases input), PEP 440 zero-padding
+    release written differently: case (some scanner exports upcase input), PEP 440 zero-padding
     (pypi 2.2.0 vs the published 2.2), and golang's v prefix (1.6.3 vs v1.6.3).
     Socket's purl endpoint returns notFound for the unpublished spelling
     (verified live), so this is what makes such rows resolve at all."""
