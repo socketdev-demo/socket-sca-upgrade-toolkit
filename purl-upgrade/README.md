@@ -38,7 +38,8 @@ slug.
 
 - **newest_version / safe_version** -- newest release, and the newest release
   Socket doesn't flag under your chosen `--safe-mode` (default: alerts your org
-  policy would act on).
+  policy would act on). Both stay inside the input version's release stream
+  (see below) and skip prereleases unless you pass `--include-prerelease`.
 - **fixes_api_version** -- for npm, pypi, and maven packages carrying a known
   CVE, the exact version the Socket Fixes API computes (the same
   dependency-graph-aware engine behind `socket fix`), with the specific GHSAs
@@ -92,6 +93,31 @@ this stage off entirely with `--no-fixes-api` if your token doesn't have the
 gem, nuget, github, apk) fall back to `safe_version` alone -- the pattern
 extends to any of them; only the manifest-synthesis step is unwritten for
 those.
+
+## Release streams
+
+Some packages publish several streams side by side under one coordinate, each
+with its own numbering. Apache Kafka's OSS line runs `4.3.1` while Confluent
+ships `8.3.1-ce` and `8.3.1-ccs` built from that same 4.3.x source; Guava
+ships `-jre` and `-android` in parallel. Comparing across them is meaningless,
+and "highest number wins" would tell a team on OSS Kafka to install a
+Confluent build.
+
+Recommendations therefore stay inside the stream the input version came from.
+A version's stream is the alphabetic part of its qualifier tail, so `4.3.1` is
+mainline, `8.3.1-ccs` is the `ccs` stream, and `1.2.3-1` (a numeric rebuild)
+is still mainline. Prereleases are a stage of the mainline, not a separate
+stream, and are handled separately.
+
+Two consequences worth knowing:
+
+- When a package's version list mixes streams, the excluded ones are named in
+  `notes`, but only when one of them would otherwise have won the
+  recommendation.
+- When the input's stream isn't published in the public registry at all (a
+  vendor or internal Artifactory build), there's no honest upgrade target to
+  name, so `recommendation_type` is `review_release_stream` and the row says
+  so instead of pointing at a mainline version that isn't a drop-in swap.
 
 ## Everything else
 

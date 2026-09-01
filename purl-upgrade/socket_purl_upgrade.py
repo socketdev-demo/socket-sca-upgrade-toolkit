@@ -86,7 +86,10 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 SOCKET_API_BASE = "https://api.socket.dev/v0"
-USER_AGENT = "socket-purl-upgrade/2.0 (+https://socket.dev)"
+# repo1.maven.org returns 403 to any User-Agent containing the substring
+# "socket" (case-insensitive, verified 2026-09-01), which silently killed every
+# Maven lookup. Keep the tool name honest but free of that substring.
+USER_AGENT = "purl-upgrade/2.0"
 DEFAULT_CACHE = os.path.expanduser("~/.cache/socket_purl_upgrade")
 CACHE_TTL = 24 * 3600
 # Folded into every cache key. Bump when a change alters what gets fetched or
@@ -280,6 +283,11 @@ class Purl:
             return f"{self.namespace}/{self.name}"
         return self.name
 
+    def without_version(self):
+        """Copy of this purl with the version dropped (for package-level links)."""
+        return Purl(self.raw, self.type, self.namespace, self.name, None,
+                    self.qualifiers, self.subpath)
+
     def with_version(self, version):
         body = self.type + "/"
         if self.namespace:
@@ -399,15 +407,23 @@ def normalize_name(eco, namespace, name):
     return namespace, name
 
 
-def registry_link(purl):
-    """Human-facing registry page for a purl. Pure and deterministic -- no I/O."""
+def registry_link(purl, info=None):
+    """Human-facing registry page for a purl. Pure and deterministic -- no I/O.
+
+    `info` is an optional already-fetched registry record; when it carries
+    coordinates that actually resolved (maven casing), those win over the
+    input purl's spelling so the link doesn't 404.
+    """
     eco, name, version = purl.type, purl.full_name, purl.version
+    info = info or {}
     if eco == "npm":
         return f"https://www.npmjs.com/package/{name}" + (f"/v/{version}" if version else "")
     if eco == "pypi":
         return f"https://pypi.org/project/{name}/" + (f"{version}/" if version else "")
     if eco == "maven" and purl.namespace:
-        base = f"https://central.sonatype.com/artifact/{purl.namespace}/{purl.name}"
+        group = info.get("resolved_namespace") or purl.namespace
+        artifact = info.get("resolved_name") or purl.name
+        base = f"https://central.sonatype.com/artifact/{group}/{artifact}"
         return base + (f"/{version}" if version else "")
     if eco == "golang":
         return f"https://pkg.go.dev/{name}" + (f"@{version}" if version else "")
@@ -509,6 +525,34 @@ def is_prerelease(eco, version):
     return version_key(eco, version)[1] == 0
 
 
+def release_stream(eco, version):
+    """Identify a parallel distribution stream, or "" for the mainline.
+
+    Some packages ship several streams side by side under one coordinate, each
+    with its own numbering: Kafka's OSS `4.3.1` next to Confluent's `8.3.1-ce`
+    and `8.3.1-ccs`, or Guava's `33.4.8-jre` next to `33.4.8-android`. The
+    numbers are not comparable across streams, so "highest number wins" will
+    happily recommend a vendor build to someone on OSS, or the reverse.
+
+    A stream is the alphabetic part of a version's qualifier tail. Numeric-only
+    tails (`1.2.3-1`, a rebuild) stay on the mainline, and prereleases are
+    excluded here because `1.0.0-rc1` is a stage of the mainline, not a
+    separate stream -- is_prerelease already handles those.
+    """
+    text = str(version or "").strip()
+    if not text:
+        return ""
+    key = version_key(eco, text)
+    if key[1] != 1:  # prerelease or post-release, not a parallel stream
+        return ""
+    words = [tok[2] for tok in key[2] if tok[0] == 1 and tok[2]]
+    return ".".join(words)
+
+
+def same_stream(eco, a, b):
+    return release_stream(eco, a) == release_stream(eco, b)
+
+
 def newest(eco, versions):
     usable = [v for v in versions if v]
     if not usable:
@@ -526,6 +570,7 @@ def empty_registry(source="", error=""):
         "display_name": "", "alternate": None, "alternate_range": "",
         "last_publish": "", "source": source, "error": error,
         "repo_url": "", "publish_dates": {},
+        "resolved_namespace": "", "resolved_name": "", "notes": "",
     }
 
 
@@ -670,9 +715,6 @@ def maven_registry(http, purl):
     if not purl.namespace:
         info["error"] = "maven purl missing groupId"
         return info
-    group_path = purl.namespace.replace(".", "/").replace("//", "/")
-    url = f"https://repo1.maven.org/maven2/{group_path}/{purl.name}/maven-metadata.xml"
-    info["source"] = url
 
     def parse(raw):
         root = ET.fromstring(raw)
@@ -681,14 +723,45 @@ def maven_registry(http, purl):
         updated = root.findtext("./versioning/lastUpdated") or ""
         return {"versions": versions, "release": release, "lastUpdated": updated}
 
-    doc = http.cached_json(url, parser=parse)
+    def metadata_url(group, artifact):
+        path = group.replace(".", "/").replace("//", "/")
+        return f"https://repo1.maven.org/maven2/{path}/{artifact}/maven-metadata.xml"
+
+    # repo1 paths are case-sensitive and 404 on the wrong casing. Scanners that
+    # infer coordinates rather than read them out of a POM routinely emit
+    # upper-cased groupIds/artifactIds, so fall back to lowercase and keep
+    # whichever casing actually resolved -- the registry link is built from it.
+    attempts = [(purl.namespace, purl.name)]
+    lowered = (purl.namespace.lower(), purl.name.lower())
+    if lowered != attempts[0]:
+        attempts.append(lowered)
+
+    doc, group, artifact = None, purl.namespace, purl.name
+    for group, artifact in attempts:
+        url = metadata_url(group, artifact)
+        info["source"] = url
+        doc = http.cached_json(url, parser=parse)
+        if doc:
+            break
     if not doc:
-        info["error"] = "maven central lookup failed"
+        # get() retries real transport errors and only gives up quietly on
+        # 404/410, so an exhausted lookup here almost always means the
+        # coordinate simply isn't on Central -- vendor repos (Confluent,
+        # Red Hat) and internal Artifactory-only artifacts land here.
+        tried = " or ".join(f"{g}:{a}" for g, a in attempts)
+        info["error"] = (f"not published on Maven Central as {tried} "
+                         "(vendor or internal repository?)")
         return info
+    info["resolved_namespace"] = group
+    info["resolved_name"] = artifact
+    if (group, artifact) != (purl.namespace, purl.name):
+        info["notes"] = (f"resolved maven coordinates as {group}:{artifact}; "
+                         f"the input purl's casing ({purl.namespace}:{purl.name}) "
+                         "does not exist on Maven Central")
     info["versions"] = doc["versions"]
     info["latest"] = doc.get("release")
     info["last_publish"] = doc.get("lastUpdated") or ""
-    info["display_name"] = f"{purl.namespace}:{purl.name}"
+    info["display_name"] = f"{group}:{artifact}"
     # Per-version publish dates and source-code links need a POM fetch per version
     # (maven-metadata.xml carries neither), which doesn't scale to a 30k-package
     # batch -- left as a known gap rather than a slow, half-reliable guess. Socket's
@@ -1363,7 +1436,7 @@ class Row:
         self.notes = []
 
 
-def pick_newest(eco, info, opts):
+def pick_newest(eco, info, opts, input_version=None):
     versions = info.get("versions") or []
     unusable = info.get("unusable") or {}
     usable = [v for v in versions if v not in unusable]
@@ -1371,7 +1444,22 @@ def pick_newest(eco, info, opts):
         stable = [v for v in usable if not is_prerelease(eco, v)]
         if stable:
             usable = stable
+    # Stay inside the input's release stream. Without an input version, the
+    # mainline is the only defensible default: a bare package lookup shouldn't
+    # answer with somebody's vendor build.
+    target = release_stream(eco, input_version) if input_version else ""
+    in_stream = [v for v in usable if release_stream(eco, v) == target]
+    if not in_stream and target:
+        # the input's stream isn't carried by this registry -- fall back to the
+        # mainline rather than to whatever sorts highest across all streams
+        in_stream = [v for v in usable if not release_stream(eco, v)]
+    if in_stream:
+        usable = in_stream
+    # the registry's own "latest" pointer only counts if it's in the same stream
     latest = info.get("latest")
+    effective = release_stream(eco, usable[0]) if in_stream and usable else target
+    if latest and release_stream(eco, latest) != effective:
+        latest = None
     if latest and (opts.include_prerelease or not is_prerelease(eco, latest)) and latest not in unusable:
         # registry-declared latest wins when it is not older than the newest we saw
         best = newest(eco, usable)
@@ -1388,11 +1476,15 @@ def build_candidates(row, opts):
     unusable = info.get("unusable") or {}
     input_version = row.purl.version
     input_key = version_key(eco, input_version) if input_version else None
+    target_stream = release_stream(eco, input_version) if input_version else ""
     pool = set()
     for version in info.get("versions") or []:
         if version in unusable:
             continue
         if not opts.include_prerelease and is_prerelease(eco, version) and version != input_version:
+            continue
+        # never probe across release streams (see release_stream)
+        if version != input_version and release_stream(eco, version) != target_stream:
             continue
         if input_key and version_key(eco, version) < input_key:
             continue
@@ -1496,7 +1588,12 @@ def analyze(row, http, socket, opts, fixes_by_key):
         except Exception:
             input_version_age_days = ""
 
-    registry_url = registry_link(purl)
+    registry_url = registry_link(purl, info)
+    # a deep link to a version the registry doesn't carry renders an empty page;
+    # fall back to the package page, which does exist
+    if purl.version and info.get("versions") and purl.version not in info["versions"] \
+            and eco not in ("apk", "github"):
+        registry_url = registry_link(purl.without_version(), info) or registry_url
     source_code_link = info.get("repo_url") or ""
     if not source_code_link and eco == "github" and purl.namespace:
         source_code_link = f"https://github.com/{purl.full_name}"
@@ -1521,9 +1618,14 @@ def analyze(row, http, socket, opts, fixes_by_key):
         else:
             replacement_source += " (unverified)"
 
+    # Version numbers only mean anything within one release stream, so an input
+    # on a stream the registry doesn't carry is not comparable to its newest.
+    comparable = bool(
+        newest_version and purl.version and same_stream(eco, purl.version, newest_version)
+    )
+    cross_stream_only = bool(newest_version and purl.version and not comparable)
     input_is_newest = bool(
-        newest_version and purl.version
-        and version_key(eco, purl.version) >= version_key(eco, newest_version)
+        comparable and version_key(eco, purl.version) >= version_key(eco, newest_version)
     )
 
     if info.get("error"):
@@ -1531,10 +1633,33 @@ def analyze(row, http, socket, opts, fixes_by_key):
     # apk indexes only current branches and the github client only pages the
     # newest 300 tags, so absence there proves nothing; every other registry
     # client returns the complete version list.
+    input_stream = release_stream(eco, purl.version) if purl.version else ""
+    # Only worth flagging when an excluded stream would otherwise have won the
+    # recommendation. Packages carry stray one-off tags (rails has a lone
+    # 5.0.0.racecar1) that are correctly skipped but not worth a line of report.
+    newest_key = version_key(eco, newest_version) if newest_version else None
+    other_streams = sorted({
+        release_stream(eco, v) for v in (info.get("versions") or [])
+        if release_stream(eco, v) and release_stream(eco, v) != input_stream
+        and (newest_key is None or version_key(eco, v) > newest_key)
+    })
+    if other_streams:
+        row.notes.append(
+            "excluded parallel release stream(s) " + ", ".join(other_streams)
+            + f"; recommendations stay in the {input_stream or 'mainline'} stream, "
+            "whose version numbers are not comparable to the others"
+        )
     if purl.version and info.get("versions") and purl.version not in info["versions"] \
             and eco not in ("apk", "github"):
-        row.notes.append(f"input version {purl.version} not published upstream "
-                         "(typo or private build?)")
+        if input_stream:
+            row.notes.append(
+                f"input version {purl.version} is on the '{input_stream}' stream, which this "
+                "registry does not publish; it likely comes from a vendor or internal "
+                "repository, so treat the version data here as mainline-only"
+            )
+        else:
+            row.notes.append(f"input version {purl.version} not published upstream "
+                             "(typo or private build?)")
     if newest_version and newest_version in (info.get("unusable") or {}):
         row.notes.append(
             f"newest release {newest_version} is {info['unusable'][newest_version]} upstream "
@@ -1586,6 +1711,28 @@ def analyze(row, http, socket, opts, fixes_by_key):
             f"API resolves {', '.join(fx['ghsas'])}{kev_note})"
         )
         recommended_purl = purl.with_version(fx["fixed_version"])
+    elif cross_stream_only:
+        # The registry carries a different distribution stream than the input.
+        # Naming its newest version here would be a cross-stream jump, so report
+        # what Socket knows about the pinned version and stop short of a target.
+        rec_type = "review_release_stream"
+        stream = release_stream(eco, purl.version) or "vendor"
+        if actionable:
+            recommendation = (
+                f"Review with your vendor: {purl.version} carries {opts.alert_label}, and the "
+                f"'{stream}' stream it belongs to is not published in this registry, so a fixed "
+                f"version in that stream has to come from the vendor. Mainline releases "
+                f"(newest {newest_version}) use a separate numbering line and are not a "
+                "drop-in upgrade"
+            )
+        else:
+            recommendation = (
+                f"No upgrade target: {purl.version} is on the '{stream}' stream, which this "
+                f"registry does not publish, so its newest version is unknown here. Mainline "
+                f"releases (newest {newest_version}) are numbered separately and are not a "
+                "drop-in upgrade"
+            )
+        recommended_purl = ""
     elif safe_version and newest_version and \
             version_key(eco, safe_version) >= version_key(eco, newest_version):
         if purl.version and version_key(eco, safe_version) == version_key(eco, purl.version):
@@ -1743,7 +1890,9 @@ def load_inputs(path, column=None):
 
 
 def write_csv(path, columns, rows):
-    with open(path, "w", newline="") as fh:
+    # utf-8-sig: Windows' default cp1252 can't encode the unicode that shows up
+    # in deprecation notices, and the BOM keeps Excel from mangling the import.
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.writer(fh)
         writer.writerow(columns)
         writer.writerows(rows)
@@ -1894,7 +2043,7 @@ def main():
     for row, info in zip(rows, infos):
         row.registry = info
         row.purl.version = reconcile_version(row.purl.type, row.purl.version, info.get("versions"))
-        row.newest = pick_newest(row.purl.type, info, opts)
+        row.newest = pick_newest(row.purl.type, info, opts, row.purl.version)
         row.candidates = build_candidates(row, opts)
 
     print("querying Socket for input versions ...")
@@ -1979,8 +2128,8 @@ def main():
             return 2
         return {
             "upgrade_fixes_api": 3, "upgrade_safe": 4, "upgrade_newest": 5, "upgrade_newest_safe": 6,
-            "no_upgrade_available": 7, "stay_current": 8, "unknown": 9,
-        }.get(rec_type, 10)
+            "review_release_stream": 7, "no_upgrade_available": 8, "stay_current": 9, "unknown": 10,
+        }.get(rec_type, 11)
 
     plans.sort(key=lambda p: (plan_rank(p), -int(p["input_actionable_alert_count"] or 0),
                               p["ecosystem"], p["package_name"].lower(),
