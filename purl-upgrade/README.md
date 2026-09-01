@@ -94,6 +94,31 @@ gem, nuget, github, apk) fall back to `safe_version` alone -- the pattern
 extends to any of them; only the manifest-synthesis step is unwritten for
 those.
 
+## Stale packages
+
+A version can carry no alerts and still be a poor recommendation, because
+nothing has shipped in a decade. Socket's unmaintained alert catches many of
+those but not all, so `package_last_release_days` and `stale_package` are
+computed independently from the newest release's publish date. Past
+`--stale-years` (default 3) the recommendation itself carries the caveat, not
+just a column:
+
+```
+Upgrade to 1.1 (newest release and no error/warn Socket alerts) - caution: no
+release in 17.9 years (last 2008-09-26), so verify the package is still
+maintained
+```
+
+Rows already described as deprecated or unmaintained don't repeat it. Where no
+publish date is available the columns stay blank and no claim is made in
+either direction, rather than treating "unknown" as "fresh".
+
+Maven needs a second source for this. `maven-metadata.xml` carries no
+per-version dates, and on older artifacts it omits `lastUpdated` entirely and
+can even be missing versions (jdom's metadata lists 1.0 but not 1.1). When
+that happens the lookup falls back to Maven Central's search index, which has
+a timestamp on every row, and merges in any versions the metadata left out.
+
 ## Release streams
 
 Some packages publish several streams side by side under one coordinate, each

@@ -69,6 +69,7 @@ import argparse
 import base64
 import csv
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import gzip
 import hashlib
 import io
@@ -135,6 +136,8 @@ PLAN_COLUMNS = [
     "input_version_age_days",
     "age_source",
     "last_publish",
+    "package_last_release_days",
+    "stale_package",
     "deprecation_reason",
     "replacement_package",
     "replacement_newest_version",
@@ -458,11 +461,26 @@ def _clean_repo_url(url):
 
 
 def _parse_iso(text):
-    """Tolerant ISO-8601 parse for the handful of date formats the registries use."""
-    text = text.strip()
+    """Tolerant date parse for the formats the registries and Socket return.
+
+    Covers ISO-8601, Maven's 14-digit lastUpdated stamp, and the RFC 2822 dates
+    that come back on Socket's unmaintained alert props. Always tz-aware, so
+    callers can subtract it from utcnow without tripping over naive datetimes.
+    """
+    text = str(text or "").strip()
+    if not text:
+        raise ValueError("empty date")
+    if re.fullmatch(r"\d{14}", text):  # maven-metadata lastUpdated
+        return datetime.strptime(text, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
-    return datetime.fromisoformat(text)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        parsed = parsedate_to_datetime(text)  # "Tue, 22 Nov 2005 18:06:33 GMT"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 # --------------------------------------------------------------------------- #
@@ -736,6 +754,33 @@ def pypi_registry(http, purl):
     return info
 
 
+def maven_search_timestamps(http, group, artifact):
+    """{version: iso date} from Maven Central's search index, or {} if it fails.
+
+    maven-metadata.xml carries no per-version dates and omits lastUpdated on
+    older artifacts; the search index has a publish timestamp on every row.
+    """
+    url = ("https://search.maven.org/solrsearch/select?"
+           + urllib.parse.urlencode({
+               "q": f'g:"{group}" AND a:"{artifact}"',
+               "core": "gav", "rows": "200", "wt": "json",
+           }))
+    doc = http.cached_json(url)
+    if not isinstance(doc, dict):
+        return {}
+    out = {}
+    for row in ((doc.get("response") or {}).get("docs") or []):
+        version, stamp = row.get("v"), row.get("timestamp")
+        if not version or not stamp:
+            continue
+        try:
+            out[version] = datetime.fromtimestamp(
+                stamp / 1000, timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            continue
+    return out
+
+
 def maven_registry(http, purl):
     info = empty_registry()
     if not purl.namespace:
@@ -787,6 +832,18 @@ def maven_registry(http, purl):
     info["versions"] = doc["versions"]
     info["latest"] = doc.get("release")
     info["last_publish"] = doc.get("lastUpdated") or ""
+    if not info["last_publish"]:
+        # Legacy artifacts predate the lastUpdated field and their metadata can
+        # also be missing versions outright (jdom lists 1.0 but not 1.1). These
+        # are exactly the decades-old packages an age check has to catch, so
+        # fall back to the search index, which carries a timestamp per version.
+        stamps = maven_search_timestamps(http, group, artifact)
+        if stamps:
+            info["publish_dates"].update(stamps)
+            for version in stamps:
+                if version not in info["versions"]:
+                    info["versions"].append(version)
+            info["last_publish"] = max(stamps.values())
     info["display_name"] = f"{group}:{artifact}"
     # Per-version publish dates and source-code links need a POM fetch per version
     # (maven-metadata.xml carries neither), which doesn't scale to a 30k-package
@@ -1614,6 +1671,26 @@ def analyze(row, http, socket, opts, fixes_by_key):
         except Exception:
             input_version_age_days = ""
 
+    # How long since the package last shipped anything. A version can carry no
+    # alerts and still be a bad recommendation because nobody has touched it in
+    # a decade, and Socket's unmaintained alert doesn't fire on every such
+    # package. Prefer the newest version's own date, fall back to the
+    # package-level last publish. No date means no claim either way.
+    newest_published_at = (info.get("publish_dates", {}).get(newest_version, "")
+                           if newest_version else "")
+    package_release_date = newest_published_at or last_publish
+    package_last_release_days = ""
+    if package_release_date:
+        try:
+            package_last_release_days = (
+                datetime.now(timezone.utc) - _parse_iso(package_release_date)).days
+        except Exception:
+            package_last_release_days = ""
+    stale_package = bool(
+        isinstance(package_last_release_days, int)
+        and package_last_release_days > opts.stale_years * 365.25
+    )
+
     # Scanner-emitted purls often differ from the registry's spelling only by
     # case (2.0B4 vs 2.0b4), so compare parsed keys rather than raw strings
     # before claiming a version is missing upstream.
@@ -1836,6 +1913,18 @@ def analyze(row, http, socket, opts, fixes_by_key):
     elif input_deprecated and not package_deprecated:
         recommendation += f" - input version {purl.version} is deprecated upstream"
 
+    # An alert-clean version of a package nobody has released in years is not a
+    # clean bill of health. Say it on the recommendation, not just in a column,
+    # unless the deprecated/unmaintained wording above already covers it.
+    if stale_package and not (package_deprecated or unmaintained or replacement):
+        years = package_last_release_days / 365.25
+        recommendation += (
+            f" - caution: no release in {years:.1f} years "
+            f"(last {package_release_date[:10]}), so verify the package is still maintained"
+        )
+        if rec_type not in ("unknown", "review_release_stream"):
+            rec_type = f"{rec_type}_stale"
+
     plan = {
         "input_purl": row.raw,
         "newest_version": newest_version,
@@ -1873,6 +1962,8 @@ def analyze(row, http, socket, opts, fixes_by_key):
         "input_version_age_days": input_version_age_days,
         "age_source": age_source,
         "last_publish": last_publish,
+        "package_last_release_days": package_last_release_days,
+        "stale_package": "TRUE" if stale_package else "FALSE",
         "deprecation_reason": (deprecation_reason or "")[:500],
         "replacement_package": replacement,
         "replacement_newest_version": replacement_version,
@@ -2011,6 +2102,9 @@ def main():
     parser.add_argument("--probe-chunk", type=int, default=4,
                         help="versions probed per package per round")
     parser.add_argument("--batch-size", type=int, default=250, help="purls per Socket API request")
+    parser.add_argument("--stale-years", type=float, default=3.0,
+                        help="flag a package whose newest release is older than this many years, "
+                             "and say so on the recommendation (default: 3)")
     parser.add_argument("--safe-mode", choices=["policy", "severity", "strict"], default="policy",
                         help="what makes a version unsafe: 'policy' = alerts your org security "
                              "policy acts on (--safe-actions), 'severity' = high/critical or "
@@ -2200,6 +2294,7 @@ def main():
         ("unparsable purls", len(skipped)),
         ("input rows with no purl", len(dropped)),
         ("safe version mode", opts.safe_mode),
+        ("stale package threshold (years)", opts.stale_years),
         ("safe version definition", opts.safe_label),
         ("prereleases considered", opts.include_prerelease),
         ("max candidate versions per package", opts.max_candidates),
