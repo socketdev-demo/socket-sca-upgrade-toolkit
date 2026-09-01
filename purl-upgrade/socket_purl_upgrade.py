@@ -471,6 +471,27 @@ def _parse_iso(text):
 
 _TOKEN_RE = re.compile(r"\d+|[A-Za-z]+")
 _RELEASE_RE = re.compile(r"^(\d+(?:\.\d+)*)(.*)$")
+# Git tags rarely arrive as bare versions. Strip a leading marker or repo-name
+# prefix so rel_3_32_0_ga, r5.10.0 and jcodings-1.0.64 rank by their numbers
+# instead of collapsing to release 0 and losing to any prerelease.
+_TAG_MARKER_RE = re.compile(r"^(?:rel(?:ease)?|ver(?:sion)?|[vr])[-_.]?(?=\d)", re.I)
+_TAG_NAME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)*)[-_][vV]?(?=\d)")
+
+
+def strip_tag_prefix(text):
+    """Drop a leading tag marker or repo-name prefix from a version string."""
+    text = str(text or "").strip()
+    match = _TAG_MARKER_RE.match(text)
+    if match:
+        return text[match.end():]
+    match = _TAG_NAME_RE.match(text)
+    if match:
+        # never strip a word that carries release-stage meaning: alpha-1 is a
+        # prerelease of 1, not a package called "alpha"
+        words = {w for w in re.findall(r"[A-Za-z]+", match.group(1).lower())}
+        if not (words & PRERELEASE_WORDS or words & POST_WORDS):
+            return text[match.end():]
+    return text
 
 
 def _tokens(text):
@@ -492,9 +513,7 @@ def _trim(nums):
 
 def version_key(eco, version):
     """Sortable key for a version string within one ecosystem."""
-    text = str(version or "").strip()
-    if re.match(r"^[vV]\d", text):
-        text = text[1:]
+    text = strip_tag_prefix(version)
     extra = ()
     if eco == "apk":
         match = re.match(r"^(.*)-r(\d+)$", text)
@@ -539,13 +558,20 @@ def release_stream(eco, version):
     excluded here because `1.0.0-rc1` is a stage of the mainline, not a
     separate stream -- is_prerelease already handles those.
     """
-    text = str(version or "").strip()
+    text = strip_tag_prefix(version)
     if not text:
         return ""
     key = version_key(eco, text)
     if key[1] != 1:  # prerelease or post-release, not a parallel stream
         return ""
-    words = [tok[2] for tok in key[2] if tok[0] == 1 and tok[2]]
+    # Work on separator-delimited segments, not letter runs. A stream tag is a
+    # whole word (ce, ccs, jre, android, spark); a segment that mixes letters
+    # and digits is a build identifier -- 1.9.117-592b42f is a commit hash, and
+    # reading "b" and "f" out of it invents streams that don't exist.
+    tail = _RELEASE_RE.match(text)
+    tail = tail.group(2) if tail else text
+    words = [seg.lower() for seg in re.split(r"[.\-_+~]+", tail)
+             if seg.isalpha() and len(seg) > 1]
     return ".".join(words)
 
 
@@ -1588,10 +1614,18 @@ def analyze(row, http, socket, opts, fixes_by_key):
         except Exception:
             input_version_age_days = ""
 
+    # Scanner-emitted purls often differ from the registry's spelling only by
+    # case (2.0B4 vs 2.0b4), so compare parsed keys rather than raw strings
+    # before claiming a version is missing upstream.
+    listed_versions = info.get("versions") or []
+    input_listed = bool(purl.version) and any(
+        version_key(eco, purl.version) == version_key(eco, v) for v in listed_versions
+    )
+
     registry_url = registry_link(purl, info)
     # a deep link to a version the registry doesn't carry renders an empty page;
     # fall back to the package page, which does exist
-    if purl.version and info.get("versions") and purl.version not in info["versions"] \
+    if purl.version and listed_versions and not input_listed \
             and eco not in ("apk", "github"):
         registry_url = registry_link(purl.without_version(), info) or registry_url
     source_code_link = info.get("repo_url") or ""
@@ -1644,12 +1678,27 @@ def analyze(row, http, socket, opts, fixes_by_key):
         and (newest_key is None or version_key(eco, v) > newest_key)
     })
     if other_streams:
+        # name the newest of each excluded stream: without it the row says a
+        # stream was skipped but leaves the reader no way to act on that
+        tips = []
+        for stream in other_streams:
+            members = [v for v in (info.get("versions") or [])
+                       if release_stream(eco, v) == stream]
+            tip = newest(eco, members)
+            tips.append(f"{stream} (newest {tip})" if tip else stream)
         row.notes.append(
-            "excluded parallel release stream(s) " + ", ".join(other_streams)
+            "excluded parallel release stream(s) " + ", ".join(tips)
             + f"; recommendations stay in the {input_stream or 'mainline'} stream, "
             "whose version numbers are not comparable to the others"
         )
-    if purl.version and info.get("versions") and purl.version not in info["versions"] \
+    if newest_version and not opts.include_prerelease and is_prerelease(eco, newest_version):
+        # the stable-only filter fell back because there is nothing stable to
+        # pick; flag it rather than quietly handing back a prerelease
+        row.notes.append(
+            f"{newest_version} is a prerelease and is still the recommendation because this "
+            "package publishes no stable release under that naming; treat it as a prerelease"
+        )
+    if purl.version and listed_versions and not input_listed \
             and eco not in ("apk", "github"):
         if input_stream:
             row.notes.append(
