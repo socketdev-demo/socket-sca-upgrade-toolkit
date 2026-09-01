@@ -179,6 +179,11 @@ PRERELEASE_HEAD_RE = re.compile(
 
 # Ecosystems the Fixes API cross-reference knows how to synthesize a manifest for.
 FIXES_API_ECOSYSTEMS = {"npm", "pypi", "maven"}
+# Ecosystems Socket itself analyses. Outside these a clean row means "no data",
+# not "no risk", and the report has to say which.
+SOCKET_ANALYZED_ECOSYSTEMS = {
+    "npm", "pypi", "maven", "nuget", "golang", "cargo", "gem", "github", "actions",
+}
 # Packages per synthesized manifest / fixes call. The Fixes API resolves the
 # whole dependency graph server-side; measured live, ~40 packages resolves in
 # ~50s, 100 takes ~260s, and 200+ times out entirely. 40 keeps each call well
@@ -438,6 +443,8 @@ def registry_link(purl, info=None):
         return f"https://www.nuget.org/packages/{name}" + (f"/{version}" if version else "")
     if eco == "github" and purl.namespace:
         return f"https://github.com/{name}" + (f"/releases/tag/{version}" if version else "")
+    if eco == "cpan":
+        return f"https://metacpan.org/dist/{purl.name}"
     if eco == "apk":
         arch = purl.qualifiers.get("arch", "x86_64")
         return f"https://pkgs.alpinelinux.org/package/edge/main/{arch}/{name}"
@@ -545,6 +552,11 @@ def version_key(eco, version):
         tail = match.group(2)
     else:
         release, tail = (0,), text
+    # CPAN marks developer/trial releases with an underscore in the version
+    # (JSON-PP 4.17_01). They are prereleases by convention and never indexed
+    # as latest, so rank them below the release they precede.
+    if eco == "cpan" and "_" in text:
+        return (release, 0, _tokens(tail), extra)
     tail = tail.lstrip("-._")
     rank = 1
     if tail:
@@ -751,6 +763,45 @@ def pypi_registry(http, purl):
     urls = doc.get("urls") or []
     if urls and urls[0].get("upload_time_iso_8601"):
         info["last_publish"] = urls[0]["upload_time_iso_8601"]
+    return info
+
+
+def cpan_registry(http, purl):
+    """MetaCPAN. purl names the distribution; any namespace is the CPAN author."""
+    info = empty_registry()
+    dist = purl.name
+    url = ("https://fastapi.metacpan.org/v1/release/_search?"
+           + urllib.parse.urlencode({
+               "q": f'distribution:"{dist}"',
+               "size": "300",
+               "_source": "version,date,status",
+           }))
+    info["source"] = url
+    doc = http.cached_json(url)
+    hits = (((doc or {}).get("hits") or {}).get("hits") or []) if isinstance(doc, dict) else []
+    if not hits:
+        info["error"] = f"no CPAN distribution named {dist}"
+        return info
+    for hit in hits:
+        src = hit.get("_source") or {}
+        version, date, status = src.get("version"), src.get("date"), src.get("status")
+        if not version:
+            continue
+        version = str(version)
+        if version not in info["versions"]:
+            info["versions"].append(version)
+        if date:
+            info["publish_dates"][version] = date
+        # "backpan" means the author pulled it from the CPAN mirrors; it stays
+        # archived but should never be an upgrade target
+        if status == "backpan":
+            info["unusable"][version] = "withdrawn from CPAN"
+        elif status == "latest":
+            info["latest"] = version
+    if info["publish_dates"]:
+        info["last_publish"] = max(info["publish_dates"].values())
+    info["display_name"] = dist
+    info["repo_url"] = f"https://metacpan.org/dist/{urllib.parse.quote(dist)}"
     return info
 
 
@@ -1033,6 +1084,8 @@ def lookup_registry(http, purl, opts):
             return github_registry(http, purl)
         if purl.type == "apk":
             return apk_registry(http, purl, opts.alpine_branches, opts.alpine_repos)
+        if purl.type == "cpan":
+            return cpan_registry(http, purl)
     except Exception as err:  # noqa: BLE001 - never let one registry kill the run
         return empty_registry(error=f"{purl.type} lookup error: {err}")
     return empty_registry(error=f"no version source for ecosystem '{purl.type}'")
@@ -1794,7 +1847,16 @@ def analyze(row, http, socket, opts, fixes_by_key):
     if info.get("notes"):
         row.notes.append(info["notes"])
     if not socket_found:
-        row.notes.append(socket.fatal or "no Socket analysis for this purl (notFound)")
+        if eco not in SOCKET_ANALYZED_ECOSYSTEMS:
+            # "no alert data" on an ecosystem Socket doesn't analyze reads as
+            # "checked and clean", which is the opposite of the truth
+            row.notes.append(
+                f"Socket does not analyze {eco} packages, so this row is registry metadata "
+                "only: version and age are upstream facts, and the absence of alerts is not "
+                "a security finding"
+            )
+        else:
+            row.notes.append(socket.fatal or "no Socket analysis for this purl (notFound)")
     if scan_pending:
         row.notes.append("Socket scan still running (pendingScan); re-run for final alerts")
     if row.unknown_versions:
