@@ -186,8 +186,14 @@ PRERELEASE_HEAD_RE = re.compile(
 FIXES_API_ECOSYSTEMS = {"npm", "pypi", "maven"}
 # Ecosystems Socket itself analyses. Outside these a clean row means "no data",
 # not "no risk", and the report has to say which.
+# Verified against the purl API rather than the docs page, because the two
+# disagree: composer and swift both come back scored with real alerts, and
+# huggingface is scored, while docker, conan and hex answer notFound and
+# openvsx isn't a recognised purl type here at all. Getting this wrong prints
+# a false disclaimer, so re-probe before editing.
 SOCKET_ANALYZED_ECOSYSTEMS = {
-    "npm", "pypi", "maven", "nuget", "golang", "cargo", "gem", "github", "actions",
+    "npm", "pypi", "maven", "nuget", "golang", "cargo", "gem", "github",
+    "composer", "swift", "huggingface",
 }
 # Packages per synthesized manifest / fixes call. The Fixes API resolves the
 # whole dependency graph server-side; measured live, ~40 packages resolves in
