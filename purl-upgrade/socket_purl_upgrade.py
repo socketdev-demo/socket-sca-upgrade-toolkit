@@ -171,6 +171,11 @@ PRERELEASE_WORDS = {
     "nightly", "canary", "next", "milestone", "cr", "insiders", "unstable", "eap",
 }
 POST_WORDS = {"post", "p", "git", "hg", "svn", "cvs"}
+# Words that describe how finished a release is, not which line it belongs to.
+# "ga" on rel_3_33_0_ga is a status, so it must never open a release stream.
+RELEASE_STATUS_WORDS = {
+    "ga", "final", "release", "stable", "rel", "fcs", "sr", "sec", "patch",
+}
 # PEP440 / Maven style markers that open a prerelease segment: 1.0b1, 5.0.0-M2, 2.0a3
 PRERELEASE_HEAD_RE = re.compile(
     r"^(?:alpha|beta|rc|prerelease|preview|pre|dev|snapshot|nightly|canary|next"
@@ -513,8 +518,10 @@ def strip_tag_prefix(text):
     if match:
         # never strip a word that carries release-stage meaning: alpha-1 is a
         # prerelease of 1, not a package called "alpha"
-        words = {w for w in re.findall(r"[A-Za-z]+", match.group(1).lower())}
-        if not (words & PRERELEASE_WORDS or words & POST_WORDS):
+        prefix = match.group(1).lower()
+        words = {w for w in re.findall(r"[A-Za-z]+", prefix)}
+        if not (words & PRERELEASE_WORDS or words & POST_WORDS
+                or PRERELEASE_HEAD_RE.match(prefix)):
             return text[match.end():]
     return text
 
@@ -557,12 +564,18 @@ def version_key(eco, version):
     # as latest, so rank them below the release they precede.
     if eco == "cpan" and "_" in text:
         return (release, 0, _tokens(tail), extra)
+    dashed = tail.startswith("-")
     tail = tail.lstrip("-._")
     rank = 1
     if tail:
         words = {w for w in re.findall(r"[A-Za-z]+", tail.lower())}
-        if eco in SEMVER_ECOSYSTEMS:
-            rank = 0  # SemVer/NuGet: any dash-suffix precedes the release, no exceptions
+        if eco in SEMVER_ECOSYSTEMS and dashed:
+            # SemVer/NuGet: a dash opens the prerelease segment, no exceptions.
+            # Only a dash, though. Git tags in these ecosystems separate with
+            # underscores and dots (javassist ships rel_3_33_0_ga, where _ga
+            # means general availability), and calling those prereleases is
+            # the opposite of what the tag says.
+            rank = 0
         elif words & PRERELEASE_WORDS or PRERELEASE_HEAD_RE.match(tail.lower()):
             rank = 0
         elif words & POST_WORDS:
@@ -591,6 +604,12 @@ def release_stream(eco, version):
     text = strip_tag_prefix(version)
     if not text:
         return ""
+    # Git tags are freeform text, not coordinates with vendor variants. Reading
+    # streams out of them splits one project's own history apart: javassist
+    # tags rel_3_33_0_ga, and treating "ga" as a stream hides its newest
+    # release behind whichever tag happens to lack a suffix.
+    if eco in ("github", "bitbucket", "gitlab"):
+        return ""
     key = version_key(eco, text)
     if key[1] != 1:  # prerelease or post-release, not a parallel stream
         return ""
@@ -601,7 +620,8 @@ def release_stream(eco, version):
     tail = _RELEASE_RE.match(text)
     tail = tail.group(2) if tail else text
     words = [seg.lower() for seg in re.split(r"[.\-_+~]+", tail)
-             if seg.isalpha() and len(seg) > 1]
+             if seg.isalpha() and len(seg) > 1
+             and seg.lower() not in RELEASE_STATUS_WORDS]
     return ".".join(words)
 
 
