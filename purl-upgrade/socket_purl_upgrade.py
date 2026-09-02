@@ -69,6 +69,7 @@ import argparse
 import base64
 import csv
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import gzip
 import hashlib
 import io
@@ -135,6 +136,8 @@ PLAN_COLUMNS = [
     "input_version_age_days",
     "age_source",
     "last_publish",
+    "package_last_release_days",
+    "stale_package",
     "deprecation_reason",
     "replacement_package",
     "replacement_newest_version",
@@ -168,6 +171,11 @@ PRERELEASE_WORDS = {
     "nightly", "canary", "next", "milestone", "cr", "insiders", "unstable", "eap",
 }
 POST_WORDS = {"post", "p", "git", "hg", "svn", "cvs"}
+# Words that describe how finished a release is, not which line it belongs to.
+# "ga" on rel_3_33_0_ga is a status, so it must never open a release stream.
+RELEASE_STATUS_WORDS = {
+    "ga", "final", "release", "stable", "rel", "fcs", "sr", "sec", "patch",
+}
 # PEP440 / Maven style markers that open a prerelease segment: 1.0b1, 5.0.0-M2, 2.0a3
 PRERELEASE_HEAD_RE = re.compile(
     r"^(?:alpha|beta|rc|prerelease|preview|pre|dev|snapshot|nightly|canary|next"
@@ -176,6 +184,17 @@ PRERELEASE_HEAD_RE = re.compile(
 
 # Ecosystems the Fixes API cross-reference knows how to synthesize a manifest for.
 FIXES_API_ECOSYSTEMS = {"npm", "pypi", "maven"}
+# Ecosystems Socket itself analyses. Outside these a clean row means "no data",
+# not "no risk", and the report has to say which.
+# Verified against the purl API rather than the docs page, because the two
+# disagree: composer and swift both come back scored with real alerts, and
+# huggingface is scored, while docker, conan and hex answer notFound and
+# openvsx isn't a recognised purl type here at all. Getting this wrong prints
+# a false disclaimer, so re-probe before editing.
+SOCKET_ANALYZED_ECOSYSTEMS = {
+    "npm", "pypi", "maven", "nuget", "golang", "cargo", "gem", "github",
+    "composer", "swift", "huggingface",
+}
 # Packages per synthesized manifest / fixes call. The Fixes API resolves the
 # whole dependency graph server-side; measured live, ~40 packages resolves in
 # ~50s, 100 takes ~260s, and 200+ times out entirely. 40 keeps each call well
@@ -435,6 +454,8 @@ def registry_link(purl, info=None):
         return f"https://www.nuget.org/packages/{name}" + (f"/{version}" if version else "")
     if eco == "github" and purl.namespace:
         return f"https://github.com/{name}" + (f"/releases/tag/{version}" if version else "")
+    if eco == "cpan":
+        return f"https://metacpan.org/dist/{purl.name}"
     if eco == "apk":
         arch = purl.qualifiers.get("arch", "x86_64")
         return f"https://pkgs.alpinelinux.org/package/edge/main/{arch}/{name}"
@@ -458,11 +479,26 @@ def _clean_repo_url(url):
 
 
 def _parse_iso(text):
-    """Tolerant ISO-8601 parse for the handful of date formats the registries use."""
-    text = text.strip()
+    """Tolerant date parse for the formats the registries and Socket return.
+
+    Covers ISO-8601, Maven's 14-digit lastUpdated stamp, and the RFC 2822 dates
+    that come back on Socket's unmaintained alert props. Always tz-aware, so
+    callers can subtract it from utcnow without tripping over naive datetimes.
+    """
+    text = str(text or "").strip()
+    if not text:
+        raise ValueError("empty date")
+    if re.fullmatch(r"\d{14}", text):  # maven-metadata lastUpdated
+        return datetime.strptime(text, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
-    return datetime.fromisoformat(text)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        parsed = parsedate_to_datetime(text)  # "Tue, 22 Nov 2005 18:06:33 GMT"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 # --------------------------------------------------------------------------- #
@@ -471,6 +507,29 @@ def _parse_iso(text):
 
 _TOKEN_RE = re.compile(r"\d+|[A-Za-z]+")
 _RELEASE_RE = re.compile(r"^(\d+(?:\.\d+)*)(.*)$")
+# Git tags rarely arrive as bare versions. Strip a leading marker or repo-name
+# prefix so rel_3_32_0_ga, r5.10.0 and jcodings-1.0.64 rank by their numbers
+# instead of collapsing to release 0 and losing to any prerelease.
+_TAG_MARKER_RE = re.compile(r"^(?:rel(?:ease)?|ver(?:sion)?|[vr])[-_.]?(?=\d)", re.I)
+_TAG_NAME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)*)[-_][vV]?(?=\d)")
+
+
+def strip_tag_prefix(text):
+    """Drop a leading tag marker or repo-name prefix from a version string."""
+    text = str(text or "").strip()
+    match = _TAG_MARKER_RE.match(text)
+    if match:
+        return text[match.end():]
+    match = _TAG_NAME_RE.match(text)
+    if match:
+        # never strip a word that carries release-stage meaning: alpha-1 is a
+        # prerelease of 1, not a package called "alpha"
+        prefix = match.group(1).lower()
+        words = {w for w in re.findall(r"[A-Za-z]+", prefix)}
+        if not (words & PRERELEASE_WORDS or words & POST_WORDS
+                or PRERELEASE_HEAD_RE.match(prefix)):
+            return text[match.end():]
+    return text
 
 
 def _tokens(text):
@@ -492,9 +551,7 @@ def _trim(nums):
 
 def version_key(eco, version):
     """Sortable key for a version string within one ecosystem."""
-    text = str(version or "").strip()
-    if re.match(r"^[vV]\d", text):
-        text = text[1:]
+    text = strip_tag_prefix(version)
     extra = ()
     if eco == "apk":
         match = re.match(r"^(.*)-r(\d+)$", text)
@@ -508,12 +565,23 @@ def version_key(eco, version):
         tail = match.group(2)
     else:
         release, tail = (0,), text
+    # CPAN marks developer/trial releases with an underscore in the version
+    # (JSON-PP 4.17_01). They are prereleases by convention and never indexed
+    # as latest, so rank them below the release they precede.
+    if eco == "cpan" and "_" in text:
+        return (release, 0, _tokens(tail), extra)
+    dashed = tail.startswith("-")
     tail = tail.lstrip("-._")
     rank = 1
     if tail:
         words = {w for w in re.findall(r"[A-Za-z]+", tail.lower())}
-        if eco in SEMVER_ECOSYSTEMS:
-            rank = 0  # SemVer/NuGet: any dash-suffix precedes the release, no exceptions
+        if eco in SEMVER_ECOSYSTEMS and dashed:
+            # SemVer/NuGet: a dash opens the prerelease segment, no exceptions.
+            # Only a dash, though. Git tags in these ecosystems separate with
+            # underscores and dots (javassist ships rel_3_33_0_ga, where _ga
+            # means general availability), and calling those prereleases is
+            # the opposite of what the tag says.
+            rank = 0
         elif words & PRERELEASE_WORDS or PRERELEASE_HEAD_RE.match(tail.lower()):
             rank = 0
         elif words & POST_WORDS:
@@ -539,13 +607,27 @@ def release_stream(eco, version):
     excluded here because `1.0.0-rc1` is a stage of the mainline, not a
     separate stream -- is_prerelease already handles those.
     """
-    text = str(version or "").strip()
+    text = strip_tag_prefix(version)
     if not text:
+        return ""
+    # Git tags are freeform text, not coordinates with vendor variants. Reading
+    # streams out of them splits one project's own history apart: javassist
+    # tags rel_3_33_0_ga, and treating "ga" as a stream hides its newest
+    # release behind whichever tag happens to lack a suffix.
+    if eco in ("github", "bitbucket", "gitlab"):
         return ""
     key = version_key(eco, text)
     if key[1] != 1:  # prerelease or post-release, not a parallel stream
         return ""
-    words = [tok[2] for tok in key[2] if tok[0] == 1 and tok[2]]
+    # Work on separator-delimited segments, not letter runs. A stream tag is a
+    # whole word (ce, ccs, jre, android, spark); a segment that mixes letters
+    # and digits is a build identifier -- 1.9.117-592b42f is a commit hash, and
+    # reading "b" and "f" out of it invents streams that don't exist.
+    tail = _RELEASE_RE.match(text)
+    tail = tail.group(2) if tail else text
+    words = [seg.lower() for seg in re.split(r"[.\-_+~]+", tail)
+             if seg.isalpha() and len(seg) > 1
+             and seg.lower() not in RELEASE_STATUS_WORDS]
     return ".".join(words)
 
 
@@ -710,6 +792,72 @@ def pypi_registry(http, purl):
     return info
 
 
+def cpan_registry(http, purl):
+    """MetaCPAN. purl names the distribution; any namespace is the CPAN author."""
+    info = empty_registry()
+    dist = purl.name
+    url = ("https://fastapi.metacpan.org/v1/release/_search?"
+           + urllib.parse.urlencode({
+               "q": f'distribution:"{dist}"',
+               "size": "300",
+               "_source": "version,date,status",
+           }))
+    info["source"] = url
+    doc = http.cached_json(url)
+    hits = (((doc or {}).get("hits") or {}).get("hits") or []) if isinstance(doc, dict) else []
+    if not hits:
+        info["error"] = f"no CPAN distribution named {dist}"
+        return info
+    for hit in hits:
+        src = hit.get("_source") or {}
+        version, date, status = src.get("version"), src.get("date"), src.get("status")
+        if not version:
+            continue
+        version = str(version)
+        if version not in info["versions"]:
+            info["versions"].append(version)
+        if date:
+            info["publish_dates"][version] = date
+        # "backpan" means the author pulled it from the CPAN mirrors; it stays
+        # archived but should never be an upgrade target
+        if status == "backpan":
+            info["unusable"][version] = "withdrawn from CPAN"
+        elif status == "latest":
+            info["latest"] = version
+    if info["publish_dates"]:
+        info["last_publish"] = max(info["publish_dates"].values())
+    info["display_name"] = dist
+    info["repo_url"] = f"https://metacpan.org/dist/{urllib.parse.quote(dist)}"
+    return info
+
+
+def maven_search_timestamps(http, group, artifact):
+    """{version: iso date} from Maven Central's search index, or {} if it fails.
+
+    maven-metadata.xml carries no per-version dates and omits lastUpdated on
+    older artifacts; the search index has a publish timestamp on every row.
+    """
+    url = ("https://search.maven.org/solrsearch/select?"
+           + urllib.parse.urlencode({
+               "q": f'g:"{group}" AND a:"{artifact}"',
+               "core": "gav", "rows": "200", "wt": "json",
+           }))
+    doc = http.cached_json(url)
+    if not isinstance(doc, dict):
+        return {}
+    out = {}
+    for row in ((doc.get("response") or {}).get("docs") or []):
+        version, stamp = row.get("v"), row.get("timestamp")
+        if not version or not stamp:
+            continue
+        try:
+            out[version] = datetime.fromtimestamp(
+                stamp / 1000, timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            continue
+    return out
+
+
 def maven_registry(http, purl):
     info = empty_registry()
     if not purl.namespace:
@@ -761,6 +909,18 @@ def maven_registry(http, purl):
     info["versions"] = doc["versions"]
     info["latest"] = doc.get("release")
     info["last_publish"] = doc.get("lastUpdated") or ""
+    if not info["last_publish"]:
+        # Legacy artifacts predate the lastUpdated field and their metadata can
+        # also be missing versions outright (jdom lists 1.0 but not 1.1). These
+        # are exactly the decades-old packages an age check has to catch, so
+        # fall back to the search index, which carries a timestamp per version.
+        stamps = maven_search_timestamps(http, group, artifact)
+        if stamps:
+            info["publish_dates"].update(stamps)
+            for version in stamps:
+                if version not in info["versions"]:
+                    info["versions"].append(version)
+            info["last_publish"] = max(stamps.values())
     info["display_name"] = f"{group}:{artifact}"
     # Per-version publish dates and source-code links need a POM fetch per version
     # (maven-metadata.xml carries neither), which doesn't scale to a 30k-package
@@ -950,6 +1110,8 @@ def lookup_registry(http, purl, opts):
             return github_registry(http, purl)
         if purl.type == "apk":
             return apk_registry(http, purl, opts.alpine_branches, opts.alpine_repos)
+        if purl.type == "cpan":
+            return cpan_registry(http, purl)
     except Exception as err:  # noqa: BLE001 - never let one registry kill the run
         return empty_registry(error=f"{purl.type} lookup error: {err}")
     return empty_registry(error=f"no version source for ecosystem '{purl.type}'")
@@ -1588,10 +1750,38 @@ def analyze(row, http, socket, opts, fixes_by_key):
         except Exception:
             input_version_age_days = ""
 
+    # How long since the package last shipped anything. A version can carry no
+    # alerts and still be a bad recommendation because nobody has touched it in
+    # a decade, and Socket's unmaintained alert doesn't fire on every such
+    # package. Prefer the newest version's own date, fall back to the
+    # package-level last publish. No date means no claim either way.
+    newest_published_at = (info.get("publish_dates", {}).get(newest_version, "")
+                           if newest_version else "")
+    package_release_date = newest_published_at or last_publish
+    package_last_release_days = ""
+    if package_release_date:
+        try:
+            package_last_release_days = (
+                datetime.now(timezone.utc) - _parse_iso(package_release_date)).days
+        except Exception:
+            package_last_release_days = ""
+    stale_package = bool(
+        isinstance(package_last_release_days, int)
+        and package_last_release_days > opts.stale_years * 365.25
+    )
+
+    # Scanner-emitted purls often differ from the registry's spelling only by
+    # case (2.0B4 vs 2.0b4), so compare parsed keys rather than raw strings
+    # before claiming a version is missing upstream.
+    listed_versions = info.get("versions") or []
+    input_listed = bool(purl.version) and any(
+        version_key(eco, purl.version) == version_key(eco, v) for v in listed_versions
+    )
+
     registry_url = registry_link(purl, info)
     # a deep link to a version the registry doesn't carry renders an empty page;
     # fall back to the package page, which does exist
-    if purl.version and info.get("versions") and purl.version not in info["versions"] \
+    if purl.version and listed_versions and not input_listed \
             and eco not in ("apk", "github"):
         registry_url = registry_link(purl.without_version(), info) or registry_url
     source_code_link = info.get("repo_url") or ""
@@ -1644,12 +1834,27 @@ def analyze(row, http, socket, opts, fixes_by_key):
         and (newest_key is None or version_key(eco, v) > newest_key)
     })
     if other_streams:
+        # name the newest of each excluded stream: without it the row says a
+        # stream was skipped but leaves the reader no way to act on that
+        tips = []
+        for stream in other_streams:
+            members = [v for v in (info.get("versions") or [])
+                       if release_stream(eco, v) == stream]
+            tip = newest(eco, members)
+            tips.append(f"{stream} (newest {tip})" if tip else stream)
         row.notes.append(
-            "excluded parallel release stream(s) " + ", ".join(other_streams)
+            "excluded parallel release stream(s) " + ", ".join(tips)
             + f"; recommendations stay in the {input_stream or 'mainline'} stream, "
             "whose version numbers are not comparable to the others"
         )
-    if purl.version and info.get("versions") and purl.version not in info["versions"] \
+    if newest_version and not opts.include_prerelease and is_prerelease(eco, newest_version):
+        # the stable-only filter fell back because there is nothing stable to
+        # pick; flag it rather than quietly handing back a prerelease
+        row.notes.append(
+            f"{newest_version} is a prerelease and is still the recommendation because this "
+            "package publishes no stable release under that naming; treat it as a prerelease"
+        )
+    if purl.version and listed_versions and not input_listed \
             and eco not in ("apk", "github"):
         if input_stream:
             row.notes.append(
@@ -1668,7 +1873,16 @@ def analyze(row, http, socket, opts, fixes_by_key):
     if info.get("notes"):
         row.notes.append(info["notes"])
     if not socket_found:
-        row.notes.append(socket.fatal or "no Socket analysis for this purl (notFound)")
+        if eco not in SOCKET_ANALYZED_ECOSYSTEMS:
+            # "no alert data" on an ecosystem Socket doesn't analyze reads as
+            # "checked and clean", which is the opposite of the truth
+            row.notes.append(
+                f"Socket does not analyze {eco} packages, so this row is registry metadata "
+                "only: version and age are upstream facts, and the absence of alerts is not "
+                "a security finding"
+            )
+        else:
+            row.notes.append(socket.fatal or "no Socket analysis for this purl (notFound)")
     if scan_pending:
         row.notes.append("Socket scan still running (pendingScan); re-run for final alerts")
     if row.unknown_versions:
@@ -1787,6 +2001,18 @@ def analyze(row, http, socket, opts, fixes_by_key):
     elif input_deprecated and not package_deprecated:
         recommendation += f" - input version {purl.version} is deprecated upstream"
 
+    # An alert-clean version of a package nobody has released in years is not a
+    # clean bill of health. Say it on the recommendation, not just in a column,
+    # unless the deprecated/unmaintained wording above already covers it.
+    if stale_package and not (package_deprecated or unmaintained or replacement):
+        years = package_last_release_days / 365.25
+        recommendation += (
+            f" - caution: no release in {years:.1f} years "
+            f"(last {package_release_date[:10]}), so verify the package is still maintained"
+        )
+        if rec_type not in ("unknown", "review_release_stream"):
+            rec_type = f"{rec_type}_stale"
+
     plan = {
         "input_purl": row.raw,
         "newest_version": newest_version,
@@ -1824,6 +2050,8 @@ def analyze(row, http, socket, opts, fixes_by_key):
         "input_version_age_days": input_version_age_days,
         "age_source": age_source,
         "last_publish": last_publish,
+        "package_last_release_days": package_last_release_days,
+        "stale_package": "TRUE" if stale_package else "FALSE",
         "deprecation_reason": (deprecation_reason or "")[:500],
         "replacement_package": replacement,
         "replacement_newest_version": replacement_version,
@@ -1962,6 +2190,9 @@ def main():
     parser.add_argument("--probe-chunk", type=int, default=4,
                         help="versions probed per package per round")
     parser.add_argument("--batch-size", type=int, default=250, help="purls per Socket API request")
+    parser.add_argument("--stale-years", type=float, default=3.0,
+                        help="flag a package whose newest release is older than this many years, "
+                             "and say so on the recommendation (default: 3)")
     parser.add_argument("--safe-mode", choices=["policy", "severity", "strict"], default="policy",
                         help="what makes a version unsafe: 'policy' = alerts your org security "
                              "policy acts on (--safe-actions), 'severity' = high/critical or "
@@ -2151,6 +2382,7 @@ def main():
         ("unparsable purls", len(skipped)),
         ("input rows with no purl", len(dropped)),
         ("safe version mode", opts.safe_mode),
+        ("stale package threshold (years)", opts.stale_years),
         ("safe version definition", opts.safe_label),
         ("prereleases considered", opts.include_prerelease),
         ("max candidate versions per package", opts.max_candidates),
