@@ -176,10 +176,11 @@ POST_WORDS = {"post", "p", "git", "hg", "svn", "cvs"}
 RELEASE_STATUS_WORDS = {
     "ga", "final", "release", "stable", "rel", "fcs", "sr", "sec", "patch",
 }
-# PEP440 / Maven style markers that open a prerelease segment: 1.0b1, 5.0.0-M2, 2.0a3
+# PEP440 / Maven style markers that open a prerelease segment: 1.0b1, 5.0.0-M2, 2.0a3.
+# edr/pfd are JCP spec stages (early draft review, proposed final draft): 2.3-edr1.
 PRERELEASE_HEAD_RE = re.compile(
     r"^(?:alpha|beta|rc|prerelease|preview|pre|dev|snapshot|nightly|canary|next"
-    r"|milestone|cr|eap|unstable|insiders|[abcm])\d*(?:$|[._\-+])"
+    r"|milestone|cr|eap|edr|pfd|unstable|insiders|[abcm])\d*(?:$|[._\-+])"
 )
 
 # Ecosystems the Fixes API cross-reference knows how to synthesize a manifest for.
@@ -512,6 +513,13 @@ _RELEASE_RE = re.compile(r"^(\d+(?:\.\d+)*)(.*)$")
 # instead of collapsing to release 0 and losing to any prerelease.
 _TAG_MARKER_RE = re.compile(r"^(?:rel(?:ease)?|ver(?:sion)?|[vr])[-_.]?(?=\d)", re.I)
 _TAG_NAME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)*)[-_][vV]?(?=\d)")
+# A commit hash, not a version. Needs at least one hex letter so an all-digit
+# date-style version such as xsdlib's 20050407 is never mistaken for one.
+_HEX_HASH_RE = re.compile(r"^(?=.*[a-f])[0-9a-f]{7,40}$", re.I)
+
+
+def is_hash_tag(text):
+    return bool(_HEX_HASH_RE.match(str(text or "").strip()))
 
 
 def strip_tag_prefix(text):
@@ -521,6 +529,11 @@ def strip_tag_prefix(text):
     if match:
         return text[match.end():]
     match = _TAG_NAME_RE.match(text)
+    if match and is_hash_tag(text[match.end():]):
+        # mozjs-source-6220f392be... is a snapshot of a commit, not a release;
+        # stripping the name would leave a hash whose leading digits rank as
+        # version 6220 and beat every real release
+        return text
     if match:
         # never strip a word that carries release-stage meaning: alpha-1 is a
         # prerelease of 1, not a package called "alpha"
@@ -553,6 +566,9 @@ def version_key(eco, version):
     """Sortable key for a version string within one ecosystem."""
     text = strip_tag_prefix(version)
     extra = ()
+    if is_hash_tag(text):
+        # a bare commit hash ranks below every real version
+        return ((0,), 0, _tokens(text), extra)
     if eco == "apk":
         match = re.match(r"^(.*)-r(\d+)$", text)
         if match:
@@ -581,7 +597,13 @@ def version_key(eco, version):
             # underscores and dots (javassist ships rel_3_33_0_ga, where _ga
             # means general availability), and calling those prereleases is
             # the opposite of what the tag says.
-            rank = 0
+            #
+            # One more carve-out for git hosts: a purely numeric dash suffix on
+            # a tag (mozjs-sys-v140.13.0-4) is a rebuild counter, not a
+            # prerelease. npm is different -- commander publishes 15.0.0-0 as a
+            # real prerelease -- so package registries keep the strict rule.
+            if not (eco in ("github", "bitbucket", "gitlab") and tail.isdigit()):
+                rank = 0
         elif words & PRERELEASE_WORDS or PRERELEASE_HEAD_RE.match(tail.lower()):
             rank = 0
         elif words & POST_WORDS:
@@ -1011,6 +1033,35 @@ def gem_registry(http, purl):
     return info
 
 
+def own_component_tags(repo, tags):
+    """Keep only the tags that version this repository's own component.
+
+    Monorepos co-tag several release lines. pydantic/pydantic carries
+    core-v2.48.0 (pydantic-core) beside its own v2.13.5; strip the prefix and
+    the two get ranked as one line, and the wrong component wins. A name
+    prefix counts as the repo's own when it starts with the repo name (the
+    mozjs-sys crate in servo/mozjs) or the repo name starts with it. Bare
+    versions, v/r/rel markers, and prerelease words pass through untouched.
+    Returns the filtered list; the caller decides what to do when it's empty.
+    """
+    def fold(text):
+        return re.sub(r"[-_.]", "", text.lower())
+
+    own = fold(repo)
+    keep = []
+    for tag in tags:
+        match = _TAG_NAME_RE.match(tag)
+        if match and not _TAG_MARKER_RE.match(tag):
+            prefix = fold(match.group(1))
+            words = set(re.findall(r"[a-z]+", match.group(1).lower()))
+            stage = bool(words & PRERELEASE_WORDS or words & POST_WORDS
+                         or PRERELEASE_HEAD_RE.match(match.group(1).lower()))
+            if not stage and not (prefix.startswith(own) or own.startswith(prefix)):
+                continue
+        keep.append(tag)
+    return keep
+
+
 def github_registry(http, purl):
     info = empty_registry()
     if not purl.namespace:
@@ -1024,24 +1075,42 @@ def github_registry(http, purl):
     info["source"] = f"https://api.github.com/repos/{owner}/{repo}/tags"
     info["repo_url"] = f"https://github.com/{owner}/{repo}"
     tags = []
+    reachable = None  # None = never asked, False = 404/403/network, True = answered
     for page in (1, 2, 3):
         url = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=100&page={page}"
         doc = http.cached_json(url, headers=headers)
+        if doc is None:
+            reachable = reachable or False
+            break
+        reachable = True
         if not doc:
             break
         tags.extend(t.get("name") for t in doc if t.get("name"))
         if len(doc) < 100:
             break
-    info["versions"] = [t for t in tags if t]
+    tags = [t for t in tags if t]
+    own = own_component_tags(repo, tags)
+    if own and len(own) < len(tags):
+        info["notes"] = (f"ignored {len(tags) - len(own)} tag(s) that version a different "
+                         f"component of the {owner}/{repo} repository")
+    info["versions"] = own or tags
     latest = http.cached_json(
         f"https://api.github.com/repos/{owner}/{repo}/releases/latest", headers=headers
     )
-    if latest and latest.get("tag_name"):
-        info["latest"] = latest["tag_name"]
+    tag = (latest or {}).get("tag_name")
+    if tag and (not own or own_component_tags(repo, [tag])):
+        info["latest"] = tag
         info["last_publish"] = latest.get("published_at") or ""
-        info["publish_dates"][latest["tag_name"]] = latest.get("published_at") or ""
+        info["publish_dates"][tag] = latest.get("published_at") or ""
     if not info["versions"] and not info["latest"]:
-        info["error"] = "github tag lookup failed"
+        # An empty tag list is a real answer, and a common one: dependencies
+        # pinned to a commit in a repository that never tagged a release.
+        # That is not a lookup failure and should not read like one.
+        if reachable:
+            info["error"] = ("repository has no tags or releases, so there is no version to "
+                             "recommend for a commit-pinned dependency")
+        else:
+            info["error"] = "github repository not found or not reachable"
     info["display_name"] = f"{owner}/{repo}"
     return info
 
@@ -1049,7 +1118,10 @@ def github_registry(http, purl):
 def apk_registry(http, purl, branches, repos):
     """Newest apk version across the configured Alpine branches/repos via APKINDEX."""
     info = empty_registry()
-    arch = purl.qualifiers.get("arch") or "x86_64"
+    requested = purl.qualifiers.get("arch") or "x86_64"
+    # Alpine publishes no noarch index; architecture-independent packages are
+    # listed in every per-arch APKINDEX, so read the x86_64 one for them.
+    arch = "x86_64" if requested == "noarch" else requested
     info["source"] = f"https://dl-cdn.alpinelinux.org/alpine/<branch>/<repo>/{arch}/APKINDEX.tar.gz"
     found = {}
     for branch in branches:
@@ -1606,21 +1678,26 @@ def pick_newest(eco, info, opts, input_version=None):
         stable = [v for v in usable if not is_prerelease(eco, v)]
         if stable:
             usable = stable
-    # Stay inside the input's release stream. Without an input version, the
-    # mainline is the only defensible default: a bare package lookup shouldn't
-    # answer with somebody's vendor build.
-    target = release_stream(eco, input_version) if input_version else ""
-    in_stream = [v for v in usable if release_stream(eco, v) == target]
-    if not in_stream and target:
-        # the input's stream isn't carried by this registry -- fall back to the
-        # mainline rather than to whatever sorts highest across all streams
-        in_stream = [v for v in usable if not release_stream(eco, v)]
-    if in_stream:
-        usable = in_stream
+    # A pinned input stays inside its own release stream. A versionless input
+    # gives us nothing to anchor a stream to, and defaulting to the mainline
+    # is worse than it sounds: guava's mainline stopped at 23.0 in 2017 while
+    # -jre and -android carried on, and deequ's mainline is years behind its
+    # -spark line. So with no input version, rank across every stream and let
+    # analyze() list each stream's newest beside the pick.
+    effective = None
+    if input_version:
+        target = release_stream(eco, input_version)
+        in_stream = [v for v in usable if release_stream(eco, v) == target]
+        if not in_stream and target:
+            # the input's stream isn't carried by this registry -- fall back to
+            # the mainline rather than to whatever sorts highest across streams
+            in_stream = [v for v in usable if not release_stream(eco, v)]
+        if in_stream:
+            usable = in_stream
+        effective = release_stream(eco, usable[0]) if usable else target
     # the registry's own "latest" pointer only counts if it's in the same stream
     latest = info.get("latest")
-    effective = release_stream(eco, usable[0]) if in_stream and usable else target
-    if latest and release_stream(eco, latest) != effective:
+    if latest and effective is not None and release_stream(eco, latest) != effective:
         latest = None
     if latest and (opts.include_prerelease or not is_prerelease(eco, latest)) and latest not in unusable:
         # registry-declared latest wins when it is not older than the newest we saw
@@ -1645,8 +1722,10 @@ def build_candidates(row, opts):
             continue
         if not opts.include_prerelease and is_prerelease(eco, version) and version != input_version:
             continue
-        # never probe across release streams (see release_stream)
-        if version != input_version and release_stream(eco, version) != target_stream:
+        # a pinned input never probes across release streams (see release_stream);
+        # a versionless one has no stream to hold to, matching pick_newest
+        if input_version and version != input_version \
+                and release_stream(eco, version) != target_stream:
             continue
         if input_key and version_key(eco, version) < input_key:
             continue
@@ -1817,6 +1896,12 @@ def analyze(row, http, socket, opts, fixes_by_key):
     input_is_newest = bool(
         comparable and version_key(eco, purl.version) >= version_key(eco, newest_version)
     )
+    # Strictly ahead of everything the public registry has: an internal or
+    # vendor build. Nothing public is an upgrade for it, and naming the public
+    # newest as a target would be a downgrade dressed up as advice.
+    input_ahead = bool(
+        comparable and version_key(eco, purl.version) > version_key(eco, newest_version)
+    )
 
     if info.get("error"):
         row.notes.append(info["error"])
@@ -1847,6 +1932,24 @@ def analyze(row, http, socket, opts, fixes_by_key):
             + f"; recommendations stay in the {input_stream or 'mainline'} stream, "
             "whose version numbers are not comparable to the others"
         )
+    if not purl.version and newest_version:
+        # versionless input: the pick ranked across streams, so show what each
+        # stream's newest is and let the reader match it to the line they run
+        per_stream = {}
+        for v in listed_versions:
+            if is_prerelease(eco, v) and not opts.include_prerelease:
+                continue
+            s = release_stream(eco, v)
+            if s not in per_stream or version_key(eco, v) > version_key(eco, per_stream[s]):
+                per_stream[s] = v
+        if len(per_stream) > 1:
+            parts = [f"{s or 'mainline'} {v}" for s, v in
+                     sorted(per_stream.items(), key=lambda kv: version_key(eco, kv[1]),
+                            reverse=True)]
+            row.notes.append(
+                "no input version, so the recommendation is the newest across all release "
+                "streams; newest per stream: " + ", ".join(parts)
+            )
     if newest_version and not opts.include_prerelease and is_prerelease(eco, newest_version):
         # the stable-only filter fell back because there is nothing stable to
         # pick; flag it rather than quietly handing back a prerelease
@@ -1947,6 +2050,70 @@ def analyze(row, http, socket, opts, fixes_by_key):
                 "drop-in upgrade"
             )
         recommended_purl = ""
+    elif input_ahead and input_listed and is_prerelease(eco, purl.version):
+        # The registry lists this version. It ranks above the newest stable
+        # only because it is a pre-release of a line with no stable release
+        # yet, so calling it an internal build would be wrong.
+        rec_type = "prerelease_in_use"
+        unusable = info.get("unusable") or {}
+        newer_pre = newest(eco, [
+            v for v in listed_versions
+            if is_prerelease(eco, v) and v not in unusable
+            and same_stream(eco, v, purl.version)
+            and version_key(eco, v) > version_key(eco, purl.version)
+        ])
+        recommendation = (
+            f"On pre-release {purl.version}; no stable release at or above it is published, "
+            f"and the newest stable release, {newest_version}, is a lower version number on "
+            "the stable line"
+        )
+        if newer_pre:
+            recommendation += f"; a newer pre-release, {newer_pre}, is available"
+        recommendation += ". Stay on the pre-release or move to the stable line deliberately"
+        if actionable:
+            recommendation += f"; note {purl.version} carries {opts.alert_label}"
+        recommended_purl = input_purl
+    elif input_ahead and input_listed:
+        # The registry lists this version too, but everything at or above it
+        # is unlisted, yanked or withdrawn, so the newest usable release sits
+        # below it. It is public; there is just no upgrade path from it.
+        rec_type = "newest_usable_in_use"
+        unusable = info.get("unusable") or {}
+        hidden = sorted(
+            (v for v in listed_versions
+             if v in unusable and same_stream(eco, v, purl.version)
+             and version_key(eco, v) > version_key(eco, purl.version)),
+            key=lambda v: version_key(eco, v),
+        )
+        recommendation = (
+            f"Stay on {purl.version}: no newer usable release upstream "
+            f"(newest listed release {newest_version})"
+        )
+        if hidden:
+            recommendation += (
+                f"; {len(hidden)} newer version(s) exist but are {unusable[hidden[-1]]} by "
+                f"the publisher ({', '.join(hidden[-3:])})"
+            )
+        own = next((reason for v, reason in unusable.items()
+                    if version_key(eco, v) == version_key(eco, purl.version)), "")
+        if own:
+            recommendation += f"; {purl.version} itself is {own}"
+        if actionable:
+            recommendation += f"; note it carries {opts.alert_label}"
+        recommended_purl = input_purl
+    elif input_ahead:
+        # Every public version sits below the one in use and the registry
+        # has never seen this one. The safe-version branches below would
+        # otherwise "upgrade" it to the public newest.
+        rec_type = "input_ahead_of_registry"
+        recommendation = (
+            f"Stay on {purl.version}: it is newer than anything published to the public "
+            f"registry (newest public release {newest_version}), so it is likely an internal "
+            "or vendor build and there is no public upgrade target"
+        )
+        if actionable:
+            recommendation += f"; note it carries {opts.alert_label}"
+        recommended_purl = input_purl
     elif safe_version and newest_version and \
             version_key(eco, safe_version) >= version_key(eco, newest_version):
         if purl.version and version_key(eco, safe_version) == version_key(eco, purl.version):
@@ -2359,8 +2526,10 @@ def main():
             return 2
         return {
             "upgrade_fixes_api": 3, "upgrade_safe": 4, "upgrade_newest": 5, "upgrade_newest_safe": 6,
-            "review_release_stream": 7, "no_upgrade_available": 8, "stay_current": 9, "unknown": 10,
-        }.get(rec_type, 11)
+            "review_release_stream": 7, "input_ahead_of_registry": 8, "prerelease_in_use": 8,
+            "newest_usable_in_use": 8, "no_upgrade_available": 9,
+            "stay_current": 10, "unknown": 11,
+        }.get(rec_type, 12)
 
     plans.sort(key=lambda p: (plan_rank(p), -int(p["input_actionable_alert_count"] or 0),
                               p["ecosystem"], p["package_name"].lower(),

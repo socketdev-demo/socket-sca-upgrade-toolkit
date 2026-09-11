@@ -144,6 +144,24 @@ Two consequences worth knowing:
   name, so `recommendation_type` is `review_release_stream` and the row says
   so instead of pointing at a mainline version that isn't a drop-in swap.
 
+## When the version in use is newer than anything public
+
+A recommendation never names a version below the one in use. Three different
+situations put the input above the registry's newest release, and the row
+says which:
+
+- `input_ahead_of_registry`: the registry has never seen the version. It is
+  an internal or vendor build, nothing public is an upgrade for it, and the
+  row says to stay put rather than "upgrade" to a lower public number.
+- `prerelease_in_use`: the registry lists the version, but it is a pre-release
+  of a line with no stable release yet (log4j-core `3.0.0-beta3` above stable
+  `2.26.1`). The row names the newest stable and any newer pre-release and
+  leaves the choice explicit.
+- `newest_usable_in_use`: the registry lists the version, but everything at or
+  above it is unlisted, yanked or withdrawn (NuGet publishers unlist whole
+  lines). The row says so and lists the hidden versions instead of calling a
+  public package an internal build.
+
 ## Everything else
 
 Version comparison, prerelease handling, deprecation-notice parsing, and the
