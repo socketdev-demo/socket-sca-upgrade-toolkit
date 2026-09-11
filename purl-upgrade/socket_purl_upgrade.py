@@ -176,10 +176,11 @@ POST_WORDS = {"post", "p", "git", "hg", "svn", "cvs"}
 RELEASE_STATUS_WORDS = {
     "ga", "final", "release", "stable", "rel", "fcs", "sr", "sec", "patch",
 }
-# PEP440 / Maven style markers that open a prerelease segment: 1.0b1, 5.0.0-M2, 2.0a3
+# PEP440 / Maven style markers that open a prerelease segment: 1.0b1, 5.0.0-M2, 2.0a3.
+# edr/pfd are JCP spec stages (early draft review, proposed final draft): 2.3-edr1.
 PRERELEASE_HEAD_RE = re.compile(
     r"^(?:alpha|beta|rc|prerelease|preview|pre|dev|snapshot|nightly|canary|next"
-    r"|milestone|cr|eap|unstable|insiders|[abcm])\d*(?:$|[._\-+])"
+    r"|milestone|cr|eap|edr|pfd|unstable|insiders|[abcm])\d*(?:$|[._\-+])"
 )
 
 # Ecosystems the Fixes API cross-reference knows how to synthesize a manifest for.
@@ -2049,9 +2050,61 @@ def analyze(row, http, socket, opts, fixes_by_key):
                 "drop-in upgrade"
             )
         recommended_purl = ""
+    elif input_ahead and input_listed and is_prerelease(eco, purl.version):
+        # The registry lists this version. It ranks above the newest stable
+        # only because it is a pre-release of a line with no stable release
+        # yet, so calling it an internal build would be wrong.
+        rec_type = "prerelease_in_use"
+        unusable = info.get("unusable") or {}
+        newer_pre = newest(eco, [
+            v for v in listed_versions
+            if is_prerelease(eco, v) and v not in unusable
+            and same_stream(eco, v, purl.version)
+            and version_key(eco, v) > version_key(eco, purl.version)
+        ])
+        recommendation = (
+            f"On pre-release {purl.version}; no stable release at or above it is published, "
+            f"and the newest stable release, {newest_version}, is a lower version number on "
+            "the stable line"
+        )
+        if newer_pre:
+            recommendation += f"; a newer pre-release, {newer_pre}, is available"
+        recommendation += ". Stay on the pre-release or move to the stable line deliberately"
+        if actionable:
+            recommendation += f"; note {purl.version} carries {opts.alert_label}"
+        recommended_purl = input_purl
+    elif input_ahead and input_listed:
+        # The registry lists this version too, but everything at or above it
+        # is unlisted, yanked or withdrawn, so the newest usable release sits
+        # below it. It is public; there is just no upgrade path from it.
+        rec_type = "newest_usable_in_use"
+        unusable = info.get("unusable") or {}
+        hidden = sorted(
+            (v for v in listed_versions
+             if v in unusable and same_stream(eco, v, purl.version)
+             and version_key(eco, v) > version_key(eco, purl.version)),
+            key=lambda v: version_key(eco, v),
+        )
+        recommendation = (
+            f"Stay on {purl.version}: no newer usable release upstream "
+            f"(newest listed release {newest_version})"
+        )
+        if hidden:
+            recommendation += (
+                f"; {len(hidden)} newer version(s) exist but are {unusable[hidden[-1]]} by "
+                f"the publisher ({', '.join(hidden[-3:])})"
+            )
+        own = next((reason for v, reason in unusable.items()
+                    if version_key(eco, v) == version_key(eco, purl.version)), "")
+        if own:
+            recommendation += f"; {purl.version} itself is {own}"
+        if actionable:
+            recommendation += f"; note it carries {opts.alert_label}"
+        recommended_purl = input_purl
     elif input_ahead:
-        # Every public version sits below the one in use. The safe-version
-        # branches below would otherwise "upgrade" it to the public newest.
+        # Every public version sits below the one in use and the registry
+        # has never seen this one. The safe-version branches below would
+        # otherwise "upgrade" it to the public newest.
         rec_type = "input_ahead_of_registry"
         recommendation = (
             f"Stay on {purl.version}: it is newer than anything published to the public "
@@ -2473,7 +2526,8 @@ def main():
             return 2
         return {
             "upgrade_fixes_api": 3, "upgrade_safe": 4, "upgrade_newest": 5, "upgrade_newest_safe": 6,
-            "review_release_stream": 7, "input_ahead_of_registry": 8, "no_upgrade_available": 9,
+            "review_release_stream": 7, "input_ahead_of_registry": 8, "prerelease_in_use": 8,
+            "newest_usable_in_use": 8, "no_upgrade_available": 9,
             "stay_current": 10, "unknown": 11,
         }.get(rec_type, 12)
 
