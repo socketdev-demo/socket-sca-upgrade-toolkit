@@ -1074,9 +1074,14 @@ def github_registry(http, purl):
     info["source"] = f"https://api.github.com/repos/{owner}/{repo}/tags"
     info["repo_url"] = f"https://github.com/{owner}/{repo}"
     tags = []
+    reachable = None  # None = never asked, False = 404/403/network, True = answered
     for page in (1, 2, 3):
         url = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=100&page={page}"
         doc = http.cached_json(url, headers=headers)
+        if doc is None:
+            reachable = reachable or False
+            break
+        reachable = True
         if not doc:
             break
         tags.extend(t.get("name") for t in doc if t.get("name"))
@@ -1097,7 +1102,14 @@ def github_registry(http, purl):
         info["last_publish"] = latest.get("published_at") or ""
         info["publish_dates"][tag] = latest.get("published_at") or ""
     if not info["versions"] and not info["latest"]:
-        info["error"] = "github tag lookup failed"
+        # An empty tag list is a real answer, and a common one: dependencies
+        # pinned to a commit in a repository that never tagged a release.
+        # That is not a lookup failure and should not read like one.
+        if reachable:
+            info["error"] = ("repository has no tags or releases, so there is no version to "
+                             "recommend for a commit-pinned dependency")
+        else:
+            info["error"] = "github repository not found or not reachable"
     info["display_name"] = f"{owner}/{repo}"
     return info
 
