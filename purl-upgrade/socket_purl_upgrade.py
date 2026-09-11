@@ -1105,7 +1105,10 @@ def github_registry(http, purl):
 def apk_registry(http, purl, branches, repos):
     """Newest apk version across the configured Alpine branches/repos via APKINDEX."""
     info = empty_registry()
-    arch = purl.qualifiers.get("arch") or "x86_64"
+    requested = purl.qualifiers.get("arch") or "x86_64"
+    # Alpine publishes no noarch index; architecture-independent packages are
+    # listed in every per-arch APKINDEX, so read the x86_64 one for them.
+    arch = "x86_64" if requested == "noarch" else requested
     info["source"] = f"https://dl-cdn.alpinelinux.org/alpine/<branch>/<repo>/{arch}/APKINDEX.tar.gz"
     found = {}
     for branch in branches:
@@ -1880,6 +1883,12 @@ def analyze(row, http, socket, opts, fixes_by_key):
     input_is_newest = bool(
         comparable and version_key(eco, purl.version) >= version_key(eco, newest_version)
     )
+    # Strictly ahead of everything the public registry has: an internal or
+    # vendor build. Nothing public is an upgrade for it, and naming the public
+    # newest as a target would be a downgrade dressed up as advice.
+    input_ahead = bool(
+        comparable and version_key(eco, purl.version) > version_key(eco, newest_version)
+    )
 
     if info.get("error"):
         row.notes.append(info["error"])
@@ -2028,6 +2037,18 @@ def analyze(row, http, socket, opts, fixes_by_key):
                 "drop-in upgrade"
             )
         recommended_purl = ""
+    elif input_ahead:
+        # Every public version sits below the one in use. The safe-version
+        # branches below would otherwise "upgrade" it to the public newest.
+        rec_type = "input_ahead_of_registry"
+        recommendation = (
+            f"Stay on {purl.version}: it is newer than anything published to the public "
+            f"registry (newest public release {newest_version}), so it is likely an internal "
+            "or vendor build and there is no public upgrade target"
+        )
+        if actionable:
+            recommendation += f"; note it carries {opts.alert_label}"
+        recommended_purl = input_purl
     elif safe_version and newest_version and \
             version_key(eco, safe_version) >= version_key(eco, newest_version):
         if purl.version and version_key(eco, safe_version) == version_key(eco, purl.version):
@@ -2440,8 +2461,9 @@ def main():
             return 2
         return {
             "upgrade_fixes_api": 3, "upgrade_safe": 4, "upgrade_newest": 5, "upgrade_newest_safe": 6,
-            "review_release_stream": 7, "no_upgrade_available": 8, "stay_current": 9, "unknown": 10,
-        }.get(rec_type, 11)
+            "review_release_stream": 7, "input_ahead_of_registry": 8, "no_upgrade_available": 9,
+            "stay_current": 10, "unknown": 11,
+        }.get(rec_type, 12)
 
     plans.sort(key=lambda p: (plan_rank(p), -int(p["input_actionable_alert_count"] or 0),
                               p["ecosystem"], p["package_name"].lower(),
